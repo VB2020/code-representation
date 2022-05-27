@@ -1,0 +1,251 @@
+public List<DefectAcceptanceTask> getDefectTasksByGuid(String guid, String taskId) {
+        log.info("Entering to getDefectTasksByGuid...");
+        var act = getActByGuid(guid);
+        logAndThrowIfNull(act, "по гуид: " + guid + " не найден акт!", HttpStatus.BAD_REQUEST);
+        var tasks = getAcceptanceTaskEntities(guid);                                       
+        logAndThrowIfNull(tasks, "по гуид: " + guid + " не нашлось операций!", HttpStatus.BAD_REQUEST);
+        var defectTasks = new ArrayList<DefectAcceptanceTask>();
+        var taskIds = act.getOperationIds();
+        var resultTaskIds = new HashSet<String>();
+        if (Objects.nonNull(taskId)) {
+            if (taskIds.contains(taskId)) {
+                resultTaskIds.add(taskId);
+            } else {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "taskId: " + taskId + "не содержится в списке айдишников операций: " + taskIds + " в рамках гуида: " + guid);
+            }
+        } else {
+            resultTaskIds.addAll(taskIds);
+        }
+
+        log.info("Начинаем формировать данные для получения дефектных операций");
+        
+        var defectHandlingUnits =
+                
+                acceptanceTaskHandlingUnitDAO.findAllByAcceptanceTaskIdIn(new ArrayList<>(resultTaskIds))              
+                .stream().map(AcceptanceTaskHandlingUnitDto::fromEntity)               
+                .filter(hUnit -> !hUnit.getItems().isEmpty()) 
+                .filter(hUnit -> (Objects.equals(hUnit.getStatus(), AcceptanceStatus.ACCEPTED) && hUnit.getItems().stream().allMatch(i -> !Objects.equals(i.getNomenclatureQuantity(), i.getNomenclatureFactQuantity())
+                                && Objects.nonNull(i.getCorruptionReason()) || !Objects.equals(i.getNomenclatureDamagedQuantity(), 0D)))
+
+                                || (Objects.equals(hUnit.getStatus(), AcceptanceStatus.ACCEPTED) && hUnit.getItems().stream().noneMatch(i -> Objects.equals(i.getNomenclatureQuantity(), i.getNomenclatureFactQuantity())))
+
+                                || (Objects.equals(hUnit.getStatus(), AcceptanceStatus.NOT_ACCEPTED)))
+
+                        
+                .map(hUnit -> {
+                    if (Objects.equals(hUnit.getStatus(), AcceptanceStatus.NOT_ACCEPTED)) {
+                        hUnit.setItems(hUnit.getItems().stream().map(item -> {
+                                       item.setNomenclatureFactQuantity(0D);
+                                       return item;
+                                       }).collect(Collectors.toList())
+                        );
+                    }
+                    return hUnit;
+                })
+                .collect(Collectors.toList());
+
+        
+        defectHandlingUnits.forEach(hu -> {
+            var filteredItems = hu.getItems().stream().filter(item ->
+                    !Objects.equals(item.getNomenclatureQuantity(), item.getNomenclatureFactQuantity())
+
+                    || (Objects.equals(item.getNomenclatureQuantity(), item.getNomenclatureFactQuantity())
+                    && Objects.nonNull(item.getNomenclatureDamagedQuantity()))).collect(Collectors.toList());
+            hu.setItems(filteredItems);
+        });
+
+       
+
+        var allMap = new HashMap<DataSet.ItemKey, DataSet.ItemValue>();
+        defectHandlingUnits.forEach(h -> h.getItems().forEach(i -> allMap.put(new DataSet.ItemKey()
+                    .setTaskId(h.getAcceptanceTaskId())
+                    .setHUnitId(h.getId())
+                    .setNomenclatureId(i.getNomenclatureId()), new DataSet.ItemValue().setHUnitItem(i))));
+       
+
+        var hUnitsMap = new HashMap<String, List<AcceptanceTaskHandlingUnitDto>>();
+        defectHandlingUnits.forEach(h -> {
+            if (hUnitsMap.containsKey(h.getAcceptanceTaskId())) {
+                var tmpList = hUnitsMap.get(h.getAcceptanceTaskId());
+                tmpList.add(h);
+                hUnitsMap.put(h.getAcceptanceTaskId(), tmpList);
+            }
+            else {
+                var tmpList = new ArrayList<AcceptanceTaskHandlingUnitDto>();
+                tmpList.add(h);
+                hUnitsMap.put(h.getAcceptanceTaskId(), tmpList);
+            }
+        });
+
+        tasks.forEach(task -> {
+                          
+                          var handlingUnits = hUnitsMap.get(task.getId());
+                          var resultHunits = new ArrayList<DefectAcceptanceTask.DefectAcceptanceTaskHandlingUnit>();
+
+                          if (Objects.nonNull(handlingUnits)) {
+                              handlingUnits.forEach(h -> {
+                                  var items = new ArrayList<AcceptanceTaskHandlingUnitItemDto>();
+                                  AtomicDouble sum = new AtomicDouble(0);
+                                  
+                                  setHuItemNomenclatureNames(h.getItems());
+                                  
+                                  var pricesMapFromActualPriceTable = actualPriceDAO.findAllByNomenclatureIdIn(
+                                                        new HashSet<>(h.getItems().stream().map(AcceptanceTaskHandlingUnitItemDto::getNomenclatureId).collect(Collectors.toList())))
+                                                        .stream().collect(Collectors.toMap(ActualPriceEntity::getNomenclatureId, ActualPriceEntity::getPrice));
+                                  h.getItems().forEach(i -> {
+                                      
+                                      i.setDifference(i.getNomenclatureQuantity() - i.getNomenclatureFactQuantity());
+                                      var price = pricesMapFromActualPriceTable.get(i.getNomenclatureId());
+                                      if (Objects.nonNull(price)) {
+                                          i.setPriceGoodsNds(roundDouble(price.doubleValue()) * i.getDifference());
+                                          
+                                          sum.set(roundDouble(sum.get()) + roundDouble(price.doubleValue()) * i.getDifference());
+                                      }
+                                      items.add(i);
+                                  });
+
+                                  resultHunits.add(new DefectAcceptanceTask.DefectAcceptanceTaskHandlingUnit(
+                                          h.getCartNumber(),
+                                          roundDouble(sum.get()),
+                                          items
+                                  ));
+                              });
+                          }
+
+                          
+                          if (!resultHunits.isEmpty()) {
+                              defectTasks.add(new DefectAcceptanceTask(
+                                      task.getId(),
+                                      task.getCreatedAt(),
+                                      
+                                      BigDecimal.valueOf(roundDouble(resultHunits.stream()
+                                              .map(DefectAcceptanceTask.DefectAcceptanceTaskHandlingUnit::getSum)
+                                              .mapToDouble(Double::doubleValue)
+                                              .sum())),
+                                      
+                                      new HashSet<>(defectHandlingUnits.stream()
+                                              .filter(hUnit -> Objects.equals(hUnit.getAcceptanceTaskId(), task.getId()))
+                                              .filter(hUnit -> Objects.nonNull(hUnit.getCorruptionReason()))
+                                              .map(AcceptanceTaskHandlingUnitDto::getCorruptionReason)
+                                              .filter(Objects::nonNull)
+                                              .filter(i -> Objects.nonNull(i.getName()))
+                                              .map(CorruptionReasonDto::getName)
+                                              .collect(Collectors.toList())),
+                                     
+                                      resultHunits
+                              ));
+                          }
+              });
+
+
+        if (defectTasks.isEmpty()) {
+            log.info("Список дефектных операций пуст!");
+            return Collections.emptyList();
+        }
+        return defectTasks;
+    }
+
+
+
+
+
+
+
+
+
+
+    @Override
+    @Transactional
+    public ApplicationReturnResponse saveApplicationReturn(ApplicationReturnRequest requestToSaveApp, Long id) {
+            logAndThrowIfNull(requestToSaveApp, APP_RETURN_CREATION_ERROR, REQUEST_400);
+            log.info("saveApplicationReturn -> request = " + requestToSaveApp);
+            logAndThrowIfNull(requestToSaveApp.getType(), APP_RETURN_TYPE_ERROR, REQUEST_400);
+            logAndThrowIfNull(requestToSaveApp.getCounterpartyId(), COUNTERPARTY_ID_ERROR, REQUEST_400);
+
+            var items = requestToSaveApp.getReturnNomenclatures();
+            logAndThrowIfNullOrEmpty(items, ITEMS_CREATION_ERROR, REQUEST_400);
+
+            var nomenclatureIds = requestToSaveApp.getReturnNomenclatures().stream().map(ApplicationReturnNomenclatureRequest::getNomenclatureId).collect(Collectors.toList());
+            var foundedNomenclaturesMap = findNomenclaturesByIds(nomenclatureIds);
+            var foundedActualPricesMap = findActualPricesByNomenclatureIds(nomenclatureIds);
+            var foundedStocksMap = findStocksByStorageCodeAndNomenclatureIds(requestToSaveApp.getStorage(), nomenclatureIds);
+
+            var applicationReturnEntity = applicationReturnMapper.map(requestToSaveApp);
+            applicationReturnEntity.setStatus(ApplicationReturnStatus.DRAFT);
+            applicationReturnEntity.setAppNumber(uidBOService.generate(UidBOOperationType.RETURN, storeCode));
+
+            var currentUser = authProvider.findAuthenticatedUser().orElseThrow(() -> new ResponseStatusException(REQUEST_404, "не найден текущий пользователь"));
+            applicationReturnEntity.setCurrentUser(currentUser);
+
+            findCounterPartyByIdOrElseThrow(requestToSaveApp.getCounterpartyId(), applicationReturnEntity);
+
+            var itemEntities = setZeroItemAmountIfNull(items).map(applicationReturnNomenclatureMapper::map).collect(Collectors.toList());
+            var itemEntitiesToSave = prepareItemsAndSaveAppReturn(id, applicationReturnEntity, itemEntities, foundedNomenclaturesMap, foundedActualPricesMap, foundedStocksMap);
+
+            var requestItemIds = requestToSaveApp.getReturnNomenclatures()
+                    .stream().map(ApplicationReturnNomenclatureRequest::getId)
+                    .filter(Objects::nonNull).collect(Collectors.toList());
+
+            var itemIdsToDelete = applicationReturnNomenclatureRepository.findAllByApplicationReturnId(id)
+                    .stream().map(ApplicationReturnNomenclatureEntity::getId)
+                    .filter(i -> !requestItemIds.contains(i)).collect(Collectors.toList());
+
+            if (!itemIdsToDelete.isEmpty()) {
+                itemIdsToDelete.forEach(applicationReturnNomenclatureRepository::deleteById);
+            }
+            applicationReturnNomenclatureRepository.saveAll(itemEntitiesToSave);
+            return getApplicationReturnById(applicationReturnEntity.getId());
+    }
+
+
+    private static Stream<ApplicationReturnNomenclatureRequest> setZeroItemAmountIfNull(List<ApplicationReturnNomenclatureRequest> returnNomenclatures) {
+        return returnNomenclatures.stream()
+                .peek(i -> {               
+                    if (Objects.isNull(i.getAmount())) {
+                        i.setAmount(0D);
+                    }
+                });
+    }
+
+
+    @Transactional
+    public List<ApplicationReturnNomenclatureEntity> prepareItemsAndSaveAppReturn(Long id, ApplicationReturnEntity applicationReturnEntity,
+                                                                                  List<ApplicationReturnNomenclatureEntity> itemEntities,
+                                                                                  Map<String, NomenclatureEntity> foundedNomenclaturesMap,
+                                                                                  Map<String, ActualPriceEntity> foundedActualPricesMap,
+                                                                                  Map<String, StockEntity> foundedStocksMap) {
+        itemEntities.forEach(item -> {
+            if (foundedStocksMap.containsKey(item.getNomenclatureId())) {
+                item.setStockAmount(foundedStocksMap.get(item.getNomenclatureId()).getQuantity());
+            }
+            item.setNomenclatureName(foundedNomenclaturesMap.get(item.getNomenclatureId()).getMatlDesc());
+            item.setBasicUnitISO(foundedNomenclaturesMap.get(item.getNomenclatureId()).getBaseUOMISO());
+
+            if (foundedActualPricesMap.containsKey(item.getNomenclatureId())) {
+                item.setPrice(foundedActualPricesMap.get(item.getNomenclatureId()).getPrice());
+                item.setTotalPrice(item.getPrice().multiply(BigDecimal.valueOf(item.getAmount())));
+            } else {              
+                item.setPrice(BigDecimal.ZERO);
+                item.setTotalPrice(BigDecimal.ZERO);
+            }
+        });
+
+        
+        itemEntities = itemEntities.stream().filter(item -> BooleanUtils.isTrue(item.getAmount() <= item.getStockAmount())).collect(Collectors.toList());
+
+        if (Objects.nonNull(applicationReturnEntity.getTotalItemsPrice())) {
+            applicationReturnEntity.setTotalItemsPrice(applicationReturnEntity.getTotalItemsPrice()
+                            .add(BigDecimal.valueOf(itemEntities.stream().map(ApplicationReturnNomenclatureEntity::getTotalPrice)
+                            .mapToDouble(BigDecimal::doubleValue).sum())));
+        } else {
+            applicationReturnEntity.setTotalItemsPrice(BigDecimal.valueOf(itemEntities.stream().map(ApplicationReturnNomenclatureEntity::getTotalPrice)
+                            .mapToDouble(BigDecimal::doubleValue).sum()));
+        }
+
+        if (Objects.nonNull(id)) {
+            applicationReturnEntity.setId(id);
+        }
+        applicationReturnRepository.save(applicationReturnEntity);
+        itemEntities.forEach(item -> item.setApplicationReturn(applicationReturnEntity));
+        return itemEntities;
+    }
